@@ -32,6 +32,9 @@ Please note, that these recomendations may become out of date if more implementa
 are added in the future; use `./configure --help` to obtain all available options.
 When in doubt, benchmark.
 
+On x86_64 platforms, the build system will now automatically select the fastest implementation (`amd64-51-30k`) if you do not specify one.
+You can still override this by passing --enable-amd64-64-24k or other flags to ./configure.
+
 
 Onion filtering settings:
 mkp224o supports multiple algorithms and data types for filtering.

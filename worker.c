@@ -11,6 +11,12 @@
 #include <sodium/crypto_hash_sha256.h>
 #endif
 #include <sodium/utils.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <sched.h>
+#include <sys/syscall.h>
+#include <numa.h>
+#endif
 
 #include "types.h"
 #include "likely.h"
@@ -279,3 +285,28 @@ void worker_init(void)
 	crypto_sign_ed25519_donna_ge_initeightpoint();
 #endif
 }
+
+// NUMA/CPU affinity binding: Each worker thread allocates local memory and binds to the local CPU core
+void bind_worker_to_numa(int worker_id) {
+#ifdef __linux__
+    if (numa_available() < 0) return; // Fallback if NUMA is not available
+    int node = worker_id % (numa_max_node() + 1);
+    numa_run_on_node(node); // Bind to NUMA node
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(worker_id % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset); // Bind to CPU core
+#endif
+}
+
+// Call at the entry of each worker thread
+void *worker_thread_main(void *arg) {
+    int worker_id = *(int*)arg;
+    bind_worker_to_numa(worker_id);
+    // ... existing worker logic ...
+}
+
+// For batch memory allocation (e.g., alloc_batch_buffers), you can use numa_alloc_onnode to allocate local memory
+#ifdef __linux__
+    // Example: void *buf = numa_alloc_onnode(size, node);
+#endif

@@ -9,3 +9,7 @@ size_t base32_from(u8 *dst,u8 *dmask,const char *src);
 // validates base32 string and optionally stores length of valid data
 // returns 1 if whole string is good, 0 if string contains invalid data
 int base32_valid(const char *src,size_t *count);
+void base32_to_bulk(char *dst, const u8 *src, size_t nblocks, size_t blocklen, size_t dst_blocklen);
+#ifdef USE_AVX2
+void base32_to_bulk_avx2(char *dst, const u8 *src, size_t nblocks, size_t blocklen, size_t dst_blocklen);
+#endif

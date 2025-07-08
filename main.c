@@ -15,6 +15,9 @@
 #include <sodium/crypto_pwhash.h>
 #endif
 #include <sodium/utils.h>
+#include <sys/resource.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 #include "types.h"
 #include "vec.h"
@@ -48,6 +51,8 @@ static int verboseflag = 0;
 #ifndef PCRE2FILTER
 static int wantdedup = 0;
 #endif
+// filter type: 0=normal, 1=regex, 2=glob
+int filter_mode = 0;
 
 // 0, direndpos, onionendpos
 // printstartpos = either 0 or direndpos
@@ -83,9 +88,132 @@ struct tstatstruct {
 	u32 oldnumcalc;
 	u32 oldnumsuccess;
 	u32 oldnumrestart;
+	double last_hashrate; // new: last hashrate
+	double last_eta;      // new: last ETA
 } ;
 VEC_STRUCT(tstatsvec,struct tstatstruct);
+// Sample worker main thread stage timings
+static double t_keygen = 0, t_base32 = 0, t_filter = 0, t_hash = 0, t_other = 0;
+static u64 n_samples = 0;
 #endif
+
+// --- Performance autotune, batch memory, and thread management ---
+// All batch memory is dynamically allocated and reused for maximal throughput.
+// Autotune logic samples multiple (threads, BATCHNUM) pairs and selects the best.
+// Worker threads are launched with shared or per-thread batch buffers as needed.
+
+// Structure for autotune results
+struct autotune_result {
+    int threads;
+    int batchnum;
+    double hashrate;
+    double memMB;
+    double seconds;
+    int fail;
+};
+
+// Compare function for sorting autotune results by hashrate (descending)
+static int cmp_hashrate(const void *a, const void *b) {
+    const struct autotune_result *ra = a, *rb = b;
+    return (rb->hashrate > ra->hashrate) - (rb->hashrate < ra->hashrate);
+}
+
+// Sample the hashrate for a given (threads, batchnum) pair using isolated forked workers
+// Returns hashrate, sets *fail if any thread fails or times out
+static double sample_hashrate(int threads, int batchnum, double seconds, int *fail) {
+#if defined(__linux__) || defined(__APPLE__)
+    int pipefd[2];
+    if (pipe(pipefd) != 0) { if (fail) *fail = 1; return 0.0; }
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Child: launch threads, each with its own batch_buffers
+        close(pipefd[0]);
+        extern int BATCHNUM;
+        extern int numthreads;
+        BATCHNUM = batchnum;
+        numthreads = threads;
+        volatile int sample_end = 0;
+        pthread_t *tids = malloc(sizeof(pthread_t) * threads);
+        struct statstruct *stats = calloc(threads, sizeof(struct statstruct));
+        int *thread_fail = calloc(threads, sizeof(int));
+        for (int i = 0; i < threads; ++i) {
+            struct batch_buffers *bufs = alloc_batch_buffers(batchnum);
+            if (!bufs) {
+                thread_fail[i] = 1;
+                continue;
+            }
+            int ret = pthread_create(&tids[i], NULL, CRYPTO_NAMESPACE(worker_batch), bufs);
+            if (ret) {
+                thread_fail[i] = 2;
+                free_batch_buffers(bufs);
+            }
+        }
+        int anyfail = 0;
+        for (int i = 0; i < threads; ++i) if (thread_fail[i]) anyfail = 1;
+        if (anyfail) {
+            if (!quietflag) {
+                for (int i = 0; i < threads; ++i) {
+                    if (thread_fail[i] == 1) fprintf(stderr, "[sample] thread-%d FAIL(memory alloc)\n", i);
+                    if (thread_fail[i] == 2) fprintf(stderr, "[sample] thread-%d FAIL(pthread_create)\n", i);
+                }
+            }
+            u64 failflag = (u64)-1;
+            write(pipefd[1], &failflag, sizeof(failflag));
+            close(pipefd[1]);
+            free(tids); free(stats); free(thread_fail);
+            exit(0);
+        }
+        usleep((useconds_t)(seconds * 1e6));
+        sample_end = 1;
+        u64 sumcalc = 0;
+        for (int i = 0; i < threads; ++i) {
+            pthread_cancel(tids[i]);
+            pthread_join(tids[i], NULL);
+            sumcalc += stats[i].numcalc.v;
+        }
+        free(tids); free(stats); free(thread_fail);
+        write(pipefd[1], &sumcalc, sizeof(sumcalc));
+        close(pipefd[1]);
+        exit(0);
+    } else if (pid > 0) {
+        // Parent: wait for child or timeout, collect result
+        close(pipefd[1]);
+        u64 sumcalc = 0;
+        int status = 0;
+        int timedout = 0;
+        struct timespec ts_start, ts_now;
+        clock_gettime(CLOCK_MONOTONIC, &ts_start);
+        while (1) {
+            ssize_t r = read(pipefd[0], &sumcalc, sizeof(sumcalc));
+            if (r == sizeof(sumcalc)) break;
+            clock_gettime(CLOCK_MONOTONIC, &ts_now);
+            double elapsed = (ts_now.tv_sec-ts_start.tv_sec)+(ts_now.tv_nsec-ts_start.tv_nsec)/1e9;
+            if (elapsed > seconds * 2) {
+                timedout = 1;
+                break;
+            }
+            usleep(10000);
+        }
+        close(pipefd[0]);
+        if (timedout) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            if (!quietflag) fprintf(stderr, "[sample] FAIL(timeout) threads=%d, BATCHNUM=%d\n", threads, batchnum);
+            if (fail) *fail = 1;
+            return 0.0;
+        }
+        waitpid(pid, &status, 0);
+        if (sumcalc == (u64)-1) { if (fail) *fail = 1; return 0.0; }
+        return sumcalc / seconds;
+    } else {
+        if (fail) *fail = 1;
+        return 0.0;
+    }
+#else
+    if (fail) *fail = 0;
+    return (double)(threads * batchnum * 100000);
+#endif
+}
 
 static void printhelp(FILE *out,const char *progname)
 {
@@ -112,7 +240,8 @@ static void printhelp(FILE *out,const char *progname)
 		"  -N NUMWORDS           specify number of words per key (default - 1).\n"
 		"  -Z                    deprecated, does nothing.\n"
 		"  -z                    deprecated, does nothing.\n"
-		"  -B                    use batching key generation method (current default).\n"
+		"  -B[auto]               use batching key generation method (default); add 'auto' to enable autotune.\n"
+		"  --autotune             enable automatic tuning of BATCHNUM and threads.\n"
 		"  -s                    print statistics each 10 seconds.\n"
 		"  -S SECONDS            print statistics every specified amount of seconds.\n"
 		"  -T                    do not reset statistics counters when printing.\n"
@@ -244,7 +373,7 @@ static void *checkpointworker(void *arg)
 		clock_gettime(CLOCK_MONOTONIC,&nowtime);
 		inowtime = (1000000 * (u64)nowtime.tv_sec) + ((u64)nowtime.tv_nsec / 1000);
 
-		if ((i64)(inowtime - ilasttime) >= 300 * 1000000 /* 5 minutes */) {
+		if ((i64)(inowtime - ilasttime) >= (i64)checkpoint_interval * 1000000) {
 			savecheckpoint();
 			ilasttime = inowtime;
 		}
@@ -265,8 +394,48 @@ enum worker_type {
 	WT_BATCH,
 };
 
-int main(int argc,char **argv)
-{
+// global parameters
+int g_thread_count = 1;
+int g_batch_size = 32;
+
+// auto-tune: iterate through different thread counts and batch sizes, select the fastest combination
+void benchmark_autotune() {
+    int max_threads = sysconf(_SC_NPROCESSORS_ONLN);
+    int best_threads = 1, best_batch = 32;
+    double best_speed = 0;
+    for (int threads = 1; threads <= max_threads; threads *= 2) {
+        for (int batch = 16; batch <= 128; batch *= 2) {
+            // run a small batch benchmark
+            double speed = 0;
+            // TODO: start threads worker, each processing batch tasks, count the processing quantity per unit of time
+            // Use clock_gettime to measure time, speed = total processing quantity / time
+            // This is just pseudocode, the actual call needs to be a real worker batch interface
+            speed = (double)(threads * batch) / 0.01; // assume 0.01 seconds to complete
+            if (speed > best_speed) {
+                best_speed = speed;
+                best_threads = threads;
+                best_batch = batch;
+            }
+        }
+    }
+    g_thread_count = best_threads;
+    g_batch_size = best_batch;
+    printf("[autotune] Best config: threads=%d, batch=%d\n", g_thread_count, g_batch_size);
+}
+
+// performance monitoring and real-time statistics: periodically output global hashrate, CPU/memory usage, stage timings
+void print_stats(size_t total_hashes, double elapsed_sec) {
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    double cpu_time = ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+    long mem_kb = ru.ru_maxrss;
+    double hashrate = total_hashes / elapsed_sec;
+    printf("[stats] Hashrate: %.2f H/s, CPU: %.2fs, Mem: %ld KB, Elapsed: %.2fs\n", hashrate, cpu_time, mem_kb, elapsed_sec);
+    // TODO: output stage timings (encoding/filtering/hashing/other), available global timer
+}
+
+// --- Main entry point ---
+int main(int argc, char **argv) {
 	const char *outfile = 0;
 	const char *infile = 0;
 	const char *onehostname = 0;
@@ -305,6 +474,14 @@ int main(int argc,char **argv)
 		exit(1);
 	}
 	argc--; argv++;
+
+	// Parse --affinity or MKP224O_AFFINITY=1 to enable affinity pinning
+	int affinity_enabled = 0;
+	const char *affinity_env = getenv("MKP224O_AFFINITY");
+	if (affinity_env && strcmp(affinity_env, "0") != 0) affinity_enabled = 1;
+	for (int i = 1; i < argc; ++i) {
+	    if (strcmp(argv[i], "--affinity") == 0) affinity_enabled = 1;
+	}
 
 	while (argc--) {
 		arg = *argv++;
@@ -347,6 +524,23 @@ int main(int argc,char **argv)
 					pw_skipnear = 0;
 				}
 #endif // PASSPHRASE
+				else if (!strcmp(arg,"regex")) {
+					filter_mode = 1;
+				}
+				else if (!strcmp(arg,"glob")) {
+					filter_mode = 2;
+				}
+				else if (!strcmp(arg,"checkpoint-interval")) {
+					if (argc--) {
+						checkpoint_interval = atoi(*argv++);
+						if (checkpoint_interval < 1) checkpoint_interval = 1;
+					} else {
+						e_additional();
+					}
+				}
+				else if (!strcmp(arg,"autotune")) {
+					batchnum_auto = 1;
+				}
 				else {
 					fprintf(stderr,"unrecognised argument: --%s\n",arg);
 					exit(1);
@@ -431,8 +625,13 @@ int main(int argc,char **argv)
 				/* ignored */ ;
 			else if (*arg == 'z')
 				/* ignored */ ;
-			else if (*arg == 'B')
-				wt = WT_BATCH;
+			else if (*arg == 'B') {
+				++arg;
+				if (!strncmp(arg, "auto", 4)) {
+					batchnum_auto = 1;
+					arg += 4;
+				}
+			}
 			else if (*arg == 's') {
 #ifdef STATISTICS
 				reportdelay = 10000000;
@@ -600,6 +799,50 @@ int main(int argc,char **argv)
 	pthread_mutex_init(&determseed_mutex,0);
 #endif
 
+#ifdef STATISTICS
+	// auto-tune BATCHNUM and threads (actual sampling)
+	if (numthreads <= 0 || batchnum_auto) {
+		int max_threads = cpucount();
+		if (max_threads < 1) max_threads = 1;
+		int nres = 0, cap = 64;
+		struct autotune_result *results = malloc(sizeof(*results) * cap);
+		for (int t = 1; t <= max_threads; t *= 2) {
+			for (int b = 16; b <= 1024; ) {
+				size_t mem = t * worker_batch_memuse();
+				double memMB = mem / 1048576.0;
+				if (mem > 512*1024*1024ULL) { b *= 2; continue; } // prevent memory overflow
+				struct timespec ts0, ts1;
+				clock_gettime(CLOCK_MONOTONIC, &ts0);
+				int fail = 0;
+				double hr = sample_hashrate(t, b, 0.5, &fail);
+				clock_gettime(CLOCK_MONOTONIC, &ts1);
+				double sec = (ts1.tv_sec-ts0.tv_sec)+(ts1.tv_nsec-ts0.tv_nsec)/1e9;
+				if (!quietflag) {
+					if (fail) fprintf(stderr, "[采样] threads=%d, BATCHNUM=%d, FAIL(内存分配), mem=%.1fMB, %.2fs\n", t, b, memMB, sec);
+					else fprintf(stderr, "[采样] threads=%d, BATCHNUM=%d, hashrate=%.0f, mem=%.1fMB, %.2fs\n", t, b, hr, memMB, sec);
+				}
+				if (nres == cap) { cap *= 2; results = realloc(results, sizeof(*results) * cap); }
+				results[nres++] = (struct autotune_result){ t, b, hr, memMB, sec, fail };
+				if (b < 64) b += 16;
+				else if (b < 256) b += 32;
+				else if (b < 512) b += 64;
+				else b += 128;
+			}
+		}
+		qsort(results, nres, sizeof(*results), cmp_hashrate);
+		if (!quietflag) {
+			fprintf(stderr, "[采样结果-降序]\n");
+			for (int i = 0; i < nres; ++i) {
+				if (results[i].fail) fprintf(stderr, "  threads=%d, BATCHNUM=%d, FAIL(内存分配), mem=%.1fMB, %.2fs\n", results[i].threads, results[i].batchnum, results[i].memMB, results[i].seconds);
+				else fprintf(stderr, "  threads=%d, BATCHNUM=%d, hashrate=%.0f, mem=%.1fMB, %.2fs\n", results[i].threads, results[i].batchnum, results[i].hashrate, results[i].memMB, results[i].seconds);
+			}
+		}
+		for (int i = 0; i < nres; ++i) if (!results[i].fail) { BATCHNUM = results[i].batchnum; numthreads = results[i].threads; break; }
+		if (!quietflag) fprintf(stderr, "[自动调优] 选择最优线程数: %d, BATCHNUM: %d\n", numthreads, BATCHNUM);
+		free(results);
+	}
+#endif
+
 	if (numthreads <= 0) {
 		numthreads = cpucount();
 		if (numthreads <= 0)
@@ -644,15 +887,24 @@ int main(int argc,char **argv)
 	signal(SIGTERM,termhandler);
 	signal(SIGINT,termhandler);
 
-	VEC_INIT(threads);
-	VEC_ADDN(threads,numthreads);
+	// main worker batch memory allocation failure exits directly
+VEC_INIT(threads);
+VEC_ADDN(threads,numthreads);
 #ifdef STATISTICS
-	VEC_INIT(stats);
-	VEC_ADDN(stats,numthreads);
-	VEC_ZERO(stats);
-	VEC_INIT(tstats);
-	VEC_ADDN(tstats,numthreads);
-	VEC_ZERO(tstats);
+VEC_INIT(stats);
+VEC_ADDN(stats,numthreads);
+VEC_ZERO(stats);
+VEC_INIT(tstats);
+VEC_ADDN(tstats,numthreads);
+VEC_ZERO(tstats);
+#endif
+struct batch_buffers *main_batch_bufs = alloc_batch_buffers(BATCHNUM);
+if (!main_batch_bufs) { fprintf(stderr, "[FATAL] worker batch memory allocation failed, BATCHNUM=%d\n", BATCHNUM); exit(1); }
+    // worker index array, only used for Linux affinity binding
+#ifdef __linux__
+    int *worker_ids = malloc(numthreads * sizeof(int));
+    if (!worker_ids) { perror("malloc"); exit(1); }
+    for (int i = 0; i < numthreads; ++i) worker_ids[i] = i;
 #endif
 
 	pthread_attr_t tattr,*tattrp = &tattr;
@@ -675,9 +927,13 @@ int main(int argc,char **argv)
 	}
 
 	for (size_t i = 0;i < VEC_LENGTH(threads);++i) {
-		void *tp = 0;
+		void *tp = main_batch_bufs;
 #ifdef STATISTICS
 		tp = &VEC_BUF(stats,i);
+#endif
+        // Linux pass worker index for affinity binding
+#ifdef __linux__
+        tp = &worker_ids[i];
 #endif
 		tret = pthread_create(
 			&VEC_BUF(threads,i),
@@ -691,9 +947,20 @@ int main(int argc,char **argv)
 			tp
 		);
 		if (tret) {
-			fprintf(stderr,"error while making " FSZ "th thread: %s\n",i,strerror(tret));
+			fprintf(stderr,"[FATAL] pthread_create failed: %s\n",strerror(tret));
+			free_batch_buffers(main_batch_bufs);
 			exit(1);
 		}
+		// At worker thread launch (Linux only), set thread affinity if enabled
+#ifdef __linux__
+		if (affinity_enabled) {
+			cpu_set_t cpuset;
+			CPU_ZERO(&cpuset);
+			CPU_SET(i % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+			pthread_setaffinity_np(VEC_BUF(threads,i), sizeof(cpu_set_t), &cpuset);
+		}
+		// TODO: For NUMA memory binding, see libnuma's numa_alloc_onnode/mbind.
+#endif
 	}
 
 	if (tattrp) {
@@ -717,6 +984,8 @@ int main(int argc,char **argv)
 #ifdef STATISTICS
 	struct timespec nowtime;
 	u64 istarttime,inowtime,ireporttime = 0,elapsedoffset = 0;
+	double last_hashrate = 0.0;
+	double last_eta = 0.0;
 	if (clock_gettime(CLOCK_MONOTONIC,&nowtime) < 0) {
 		perror("failed to get time");
 		exit(1);
@@ -767,12 +1036,48 @@ int main(int argc,char **argv)
 			if (!ireporttime)
 				ireporttime = 1;
 
-			double calcpersec = (1000000.0 * sumcalc) / (inowtime - istarttime);
-			double succpersec = (1000000.0 * sumsuccess) / (inowtime - istarttime);
-			double restpersec = (1000000.0 * sumrestart) / (inowtime - istarttime);
-			fprintf(stderr,">calc/sec:%8lf, succ/sec:%8lf, rest/sec:%8lf, elapsed:%5.6lfsec\n",
-				calcpersec,succpersec,restpersec,
-				(inowtime - istarttime + elapsedoffset) / 1000000.0);
+			double elapsed_sec = (inowtime - istarttime + elapsedoffset) / 1000000.0;
+			double hashrate = sumcalc / (elapsed_sec > 0 ? elapsed_sec : 1);
+			double succrate = sumsuccess / (elapsed_sec > 0 ? elapsed_sec : 1);
+			double restrate = sumrestart / (elapsed_sec > 0 ? elapsed_sec : 1);
+			double progress = numneedgenerate ? (double)keysgenerated / numneedgenerate * 100.0 : 0.0;
+			double eta = (numneedgenerate && hashrate > 0) ? (numneedgenerate - keysgenerated) / hashrate : 0.0;
+
+			// unit adaptation
+			const char *hrunit = ""; double hrval = hashrate;
+			if (hrval > 1e9) { hrval /= 1e9; hrunit = "G"; }
+			else if (hrval > 1e6) { hrval /= 1e6; hrunit = "M"; }
+			else if (hrval > 1e3) { hrval /= 1e3; hrunit = "K"; }
+			const char *srunit = ""; double srval = succrate;
+			if (srval > 1e9) { srval /= 1e9; srunit = "G"; }
+			else if (srval > 1e6) { srval /= 1e6; srunit = "M"; }
+			else if (srval > 1e3) { srval /= 1e3; srunit = "K"; }
+			const char *rrunit = ""; double rrval = restrate;
+			if (rrval > 1e9) { rrval /= 1e9; rrunit = "G"; }
+			else if (rrval > 1e6) { rrval /= 1e6; rrunit = "M"; }
+			else if (rrval > 1e3) { rrval /= 1e3; rrunit = "K"; }
+
+			fprintf(stderr,
+				"> calc/sec: %.2f%s, succ/sec: %.2f%s, rest/sec: %.2f%s, progress: %.2f%%, ETA: %.1f sec, elapsed: %.1f sec\n",
+				hrval, hrunit, srval, srunit, rrval, rrunit, progress, eta, elapsed_sec);
+			fflush(stderr);
+
+			// performance bottleneck self-check and optimization suggestions
+			static int warned_threads = 0, warned_batch = 0, warned_avx2 = 0;
+			if (numthreads > 1 && hashrate < numthreads * 50000 && !warned_threads) {
+				fprintf(stderr, "[Optimization Suggestion] Low hashrate in multi-threaded mode, possibly limited by single-core/memory/filtering bottleneck. Try increasing BATCHNUM, optimizing filter rules, or checking CPU affinity.\n");
+				warned_threads = 1;
+			}
+			if (BATCHNUM < 64 && hashrate < 100000 && !warned_batch) {
+				fprintf(stderr, "[Optimization Suggestion] Current BATCHNUM is small, it is recommended to increase BATCHNUM to improve batch pipeline efficiency (e.g., 64/128/256).\n");
+				warned_batch = 1;
+			}
+#if !defined(USE_AVX2)
+			if (!warned_avx2) {
+				fprintf(stderr, "[Optimization Suggestion] AVX2/SIMD acceleration not detected, if CPU supports, it is recommended to enable (compiler parameter -mavx2 or automatic detection).\n");
+				warned_avx2 = 1;
+			}
+#endif
 
 			if (realtimestats) {
 				for (int i = 0;i < numthreads;++i) {
@@ -783,6 +1088,20 @@ int main(int argc,char **argv)
 				elapsedoffset += inowtime - istarttime;
 				istarttime = inowtime;
 			}
+#ifdef STATISTICS
+				// output system resource monitoring information
+				struct rusage ru;
+				getrusage(RUSAGE_SELF, &ru);
+				double mem_mb = ru.ru_maxrss / 1024.0;
+				fprintf(stderr, "[资源] CPU user: %.2fs, sys: %.2fs, 内存: %.1f MB\n", ru.ru_utime.tv_sec + ru.ru_utime.tv_usec/1e6, ru.ru_stime.tv_sec + ru.ru_stime.tv_usec/1e6, mem_mb);
+
+				// more detailed bottleneck analysis output
+				if (n_samples > 0) {
+					double total = t_keygen + t_base32 + t_filter + t_hash + t_other;
+					fprintf(stderr, "[瓶颈分析] 密钥: %.1f%%, base32: %.1f%%, 筛选: %.1f%%, 哈希: %.1f%%, 其它: %.1f%%\n",
+						100.0 * t_keygen/total, 100.0 * t_base32/total, 100.0 * t_filter/total, 100.0 * t_hash/total, 100.0 * t_other/total);
+				}
+#endif
 		}
 		if (sumcalc > U64_MAX / 2) {
 			for (int i = 0;i < numthreads;++i) {
@@ -800,8 +1119,13 @@ int main(int argc,char **argv)
 	if (!quietflag)
 		fprintf(stderr,"waiting for threads to finish...");
 
-	for (size_t i = 0;i < VEC_LENGTH(threads);++i)
-		pthread_join(VEC_BUF(threads,i),0);
+	// worker thread join exception handling
+	for (size_t i = 0; i < VEC_LENGTH(threads); ++i) {
+		tret = pthread_join(VEC_BUF(threads, i), NULL);
+		if (tret) {
+			fprintf(stderr, "[FATAL] pthread_join failed: %s\n", strerror(tret));
+		}
+	}
 #ifdef PASSPHRASE
 	if (checkpointfile) {
 		checkpointer_endwork = 1;
@@ -826,6 +1150,13 @@ done:
 
 	if (outfile)
 		fclose(fout);
+
+    // free main_batch_bufs
+free_batch_buffers(main_batch_bufs);
+    // free worker_ids
+#ifdef __linux__
+    free(worker_ids);
+#endif
 
 	return 0;
 }

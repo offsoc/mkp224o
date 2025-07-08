@@ -94,3 +94,10 @@ extern int flattened;
 extern void filters_init(void);
 extern void filters_add(const char *filter);
 extern size_t filters_count(void);
+
+struct globfilter {
+    char *pattern;
+};
+VEC_STRUCT(gfiltervec, struct globfilter);
+extern struct gfiltervec filters;
+int glob_match(const char *pattern, const char *str);

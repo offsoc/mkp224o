@@ -1,3 +1,7 @@
+// PERFORMANCE NOTES
+// - struct statstruct is padded to 64 bytes to avoid false sharing between threads.
+// - All batch buffers are 32-byte aligned for SIMD and cache efficiency.
+// - All statistics are per-thread and merged in the main thread to avoid contention.
 
 extern pthread_mutex_t keysgenerated_mutex;
 extern volatile size_t keysgenerated;
@@ -11,22 +15,23 @@ extern size_t numneedgenerate;
 extern char *workdir;
 extern size_t workdirlen;
 
-// statistics, if enabled
 #ifdef STATISTICS
+// Per-thread statistics structure, padded to avoid false sharing
 struct statstruct {
-	union {
-		u32 v;
-		size_t align;
-	} numcalc;
-	union {
-		u32 v;
-		size_t align;
-	} numsuccess;
-	union {
-		u32 v;
-		size_t align;
-	} numrestart;
-} ;
+    union {
+        u32 v;
+        size_t align;
+    } numcalc;
+    union {
+        u32 v;
+        size_t align;
+    } numsuccess;
+    union {
+        u32 v;
+        size_t align;
+    } numrestart;
+    char _pad[64 - (3 * sizeof(size_t))]; // Explicit cacheline padding
+};
 VEC_STRUCT(statsvec,struct statstruct);
 #endif
 

@@ -192,3 +192,10 @@ do { \
 } while (0)
 
 #endif // PCRE2FILTER
+
+// 批量二进制/前缀/掩码筛选接口
+static inline void filters_match_bin_bulk(const char **onions, int *results, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        results[i] = DOFILTER(onions[i]);
+    }
+}

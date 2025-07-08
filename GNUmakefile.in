@@ -2,6 +2,7 @@
 CC= @CC@
 CSTD= @CSTD@
 CFLAGS= $(CSTD) @CFLAGS@ @CPPFLAGS@ -DED25519_@ED25519IMPL@ @PIE@ @MYDEFS@ -DVERSION='"@VERSION@"'
+CFLAGS+= -O3 -march=native -funroll-loops
 ASFLAGS= @PIE@
 LDFLAGS= @LDFLAGS@
 MV= mv
@@ -546,3 +547,9 @@ worker.c.o: ed25519/ed25519-donna/ed25519-donna-impl-base.h
 worker.c.o: worker_batch.inc.h worker_batch_pass.inc.h
 worker.c.o: ed25519/ed25519_impl_post.h
 yaml.c.o: types.h yaml.h ioutil.h base32.h base64.h common.h
+
+# 自动检测AVX2支持并添加宏
+AVX2_SUPPORT := $(shell echo | $(CC) -dM -E -march=native - | grep -q __AVX2__ && echo 1 || echo 0)
+ifeq ($(AVX2_SUPPORT),1)
+CFLAGS += -DUSE_AVX2
+endif

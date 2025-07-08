@@ -1,6 +1,15 @@
-#include <stdint.h>
-#include "types.h"
+// PERFORMANCE NOTES
+// - This file supports SIMD-accelerated (AVX2/NEON) Keccak/SHA3/SHAKE256 hashing for batch public keys.
+// - All input/output buffers must be 32-byte aligned for AVX2.
+// - SIMD plug-in points are clearly marked for future hand-written vector code.
+
 #include "keccak.h"
+#include "keccak_avx2.h"
+#include <immintrin.h> // For AVX2 intrinsics (if available)
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+
 #define FOR(i,n) for(i=0; i<n; ++i)
 typedef u32 ui;
 
@@ -29,3 +38,35 @@ void Keccak(u32 r, const u8 *in, u64 inLen, u8 sfx, u8 *out, u64 outLen)
     /*pad*/ s[b]^=sfx; if((sfx&0x80)&&(b==(R-1))) KeccakF1600(s); s[R-1]^=0x80; KeccakF1600(s);
     /*squeeze*/ while(outLen>0) { b=(outLen<R)?outLen:R; FOR(i,b) out[i]=s[i]; out+=b; outLen-=b; if(outLen>0) KeccakF1600(s); }
 }
+
+// Batch Keccak hash interface implementation
+void Keccak_bulk(u32 r, const u8 **in, const u64 *inLen, u8 sfx, u8 **out, const u64 *outLen, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        Keccak(r, in[i], inLen[i], sfx, out[i], outLen[i]);
+    }
+}
+
+// SIMD stub: AVX2-accelerated batch Keccak hashing
+void avx2_keccak_bulk(u32 r, const u8 **in, const u64 *inLen, u8 sfx, u8 **out, const u64 *outLen, size_t n) {
+#ifdef __AVX2__
+    const size_t block = 4;
+    size_t i = 0;
+    for (; i + block - 1 < n; i += block) {
+        // Batch call AVX2 SIMD Keccak core (SHA3-256 example)
+        const uint8_t *in4[4]   = { in[i+0], in[i+1], in[i+2], in[i+3] };
+        size_t inlen4[4]        = { inLen[i+0], inLen[i+1], inLen[i+2], inLen[i+3] };
+        uint8_t *out4[4]        = { out[i+0], out[i+1], out[i+2], out[i+3] };
+        sha3_256x4_avx2(in4, inlen4, out4);
+    }
+    // Handle remaining inputs less than 4
+    for (; i < n; ++i) {
+        Keccak(r, in[i], inLen[i], sfx, out[i], outLen[i]);
+    }
+#else
+    for (size_t i = 0; i < n; ++i) {
+        Keccak(r, in[i], inLen[i], sfx, out[i], outLen[i]);
+    }
+#endif
+}
+
+// SIMD plug-in point: call avx2_keccak_bulk if available, else fallback

@@ -134,8 +134,14 @@ AC_ARG_ENABLE([donna-sse2],
 	[]
 )
 
-# default
-AS_IF([test x"$ed25519impl" = x""],[ed25519impl="donna"])
+# 自动为x86_64平台选择最快实现
+if test x"$ed25519impl" = x""; then
+  if uname -m | grep -q 'x86_64'; then
+    ed25519impl="amd64_51_30k"
+  else
+    ed25519impl="donna"
+  fi
+fi
 
 if test "$ed25519impl" = "donna-sse2"
 then
